@@ -1,10 +1,12 @@
 import { Inngest } from 'inngest'
 import { supabaseAdmin } from './supabase'
+import { getSyncEngine, getSupportedEntityTypes } from './sync'
+import type { SystemId, EntityType } from '@/types/supabase'
 
 // Create Inngest client
-export const inngest = new Inngest({ 
+export const inngest = new Inngest({
   id: 'smsi-sync',
-  name: 'SMSI Sync'
+  name: 'SMSI Sync',
 })
 
 // Event types
@@ -45,7 +47,7 @@ export const syncApp = inngest.createFunction(
           })
           .eq('id', requestId)
       }
-      
+
       // Update app status
       await supabaseAdmin
         .from('sync_apps')
@@ -61,6 +63,7 @@ export const syncApp = inngest.createFunction(
   async ({ event, step }) => {
     const { app_id, direction, entity_types, request_id, triggered_by } = event.data
     const startTime = Date.now()
+    const systemId = app_id as SystemId
 
     // Step 1: Mark request as processing
     await step.run('mark-processing', async () => {
@@ -73,12 +76,21 @@ export const syncApp = inngest.createFunction(
         .eq('id', request_id)
     })
 
-    // Step 2: Create sync run record
+    // Step 2: Determine entity types to sync
+    const entitiesToSync = await step.run('determine-entities', async () => {
+      if (entity_types && entity_types.length > 0) {
+        return entity_types as EntityType[]
+      }
+      // Get all supported entity types for this system
+      return getSupportedEntityTypes(systemId)
+    })
+
+    // Step 3: Create sync run record
     const syncRun = await step.run('create-sync-run', async () => {
       const { data, error } = await supabaseAdmin
         .from('sync_runs')
         .insert({
-          entity_type: entity_types?.[0] || 'all',
+          entity_type: entitiesToSync.join(','),
           source_system: direction === 'export' ? 'supabase' : app_id,
           target_system: direction === 'export' ? app_id : 'supabase',
           direction: direction === 'both' ? 'bidirectional' : direction,
@@ -91,53 +103,82 @@ export const syncApp = inngest.createFunction(
       return data
     })
 
-    // Step 3: Execute the actual sync based on app_id
+    // Step 4: Execute the sync using the sync engine
     const result = await step.run('execute-sync', async () => {
-      // Route to appropriate sync handler
-      switch (app_id) {
-        case 'creator':
-          return await syncCreator(direction, entity_types)
-        case 'crm':
-          return await syncCRM(direction, entity_types)
-        case 'intacct':
-          return await syncIntacct(direction, entity_types)
-        case 'adp':
-          return await syncADP()
-        case 'absorb':
-          return await syncAbsorb()
-        case 'ramp':
-          return await syncRamp()
-        default:
-          throw new Error(`Unknown app: ${app_id}`)
+      const engine = getSyncEngine()
+
+      // Handle 'both' direction
+      if (direction === 'both') {
+        // First import, then export
+        const importResult = await engine.runSync({
+          systemId,
+          direction: 'import',
+          entityTypes: entitiesToSync,
+          runId: syncRun.id,
+          triggeredBy: triggered_by || 'manual',
+          startTime: new Date(),
+        })
+
+        const exportResult = await engine.runSync({
+          systemId,
+          direction: 'export',
+          entityTypes: entitiesToSync,
+          runId: syncRun.id,
+          triggeredBy: triggered_by || 'manual',
+          startTime: new Date(),
+        })
+
+        return {
+          processed: importResult.processed + exportResult.processed,
+          created: importResult.created + exportResult.created,
+          updated: importResult.updated + exportResult.updated,
+          failed: importResult.failed + exportResult.failed,
+          errors: [...importResult.errors, ...exportResult.errors],
+        }
       }
+
+      // Single direction
+      return engine.runSync({
+        systemId,
+        direction,
+        entityTypes: entitiesToSync,
+        runId: syncRun.id,
+        triggeredBy: triggered_by || 'manual',
+        startTime: new Date(),
+      })
     })
 
     const duration = Date.now() - startTime
+    const hasErrors = result.failed > 0
 
-    // Step 4: Update sync run with results
+    // Step 5: Update sync run with results
     await step.run('update-sync-run', async () => {
       await supabaseAdmin
         .from('sync_runs')
         .update({
-          status: result.failed > 0 ? 'partial' : 'completed',
+          status: hasErrors ? 'partial' : 'completed',
           completed_at: new Date().toISOString(),
           records_processed: result.processed,
           records_created: result.created,
           records_updated: result.updated,
           records_failed: result.failed,
-          error_message: result.error,
+          error_message: result.errors.length > 0
+            ? result.errors.map(e => e.error).join('; ').slice(0, 500)
+            : null,
         })
         .eq('id', syncRun.id)
     })
 
-    // Step 5: Update app status
+    // Step 6: Update app status
     await step.run('update-app-status', async () => {
       await supabaseAdmin
         .from('sync_apps')
         .update({
           last_sync_at: new Date().toISOString(),
-          last_sync_status: result.failed > 0 ? 'partial' : 'success',
-          last_sync_message: result.error || null,
+          last_sync_status: hasErrors ? 'partial' : 'success',
+          last_sync_message: hasErrors
+            ? `${result.failed} records failed`
+            : null,
           last_sync_duration_ms: duration,
           last_records_processed: result.processed,
           last_records_created: result.created,
@@ -147,21 +188,23 @@ export const syncApp = inngest.createFunction(
         .eq('id', app_id)
     })
 
-    // Step 6: Complete the request
+    // Step 7: Complete the request
     await step.run('complete-request', async () => {
       await supabaseAdmin
         .from('sync_requests')
         .update({
-          status: result.failed > 0 ? 'failed' : 'completed',
+          status: hasErrors ? 'failed' : 'completed',
           completed_at: new Date().toISOString(),
           sync_run_id: syncRun.id,
-          error_message: result.error,
+          error_message: hasErrors
+            ? result.errors.map(e => e.error).join('; ').slice(0, 500)
+            : null,
         })
         .eq('id', request_id)
     })
 
     return {
-      success: result.failed === 0,
+      success: !hasErrors,
       duration,
       ...result,
     }
@@ -220,52 +263,6 @@ export const scheduledSync = inngest.createFunction(
     return { triggered: apps.length }
   }
 )
-
-// Sync result type
-type SyncResult = {
-  processed: number
-  created: number
-  updated: number
-  failed: number
-  error?: string
-}
-
-// Placeholder sync handlers - implement actual API calls
-async function syncCreator(direction: string, entityTypes?: string[]): Promise<SyncResult> {
-  // TODO: Implement Zoho Creator sync
-  console.log('Syncing Creator:', { direction, entityTypes })
-  return { processed: 0, created: 0, updated: 0, failed: 0 }
-}
-
-async function syncCRM(direction: string, entityTypes?: string[]): Promise<SyncResult> {
-  // TODO: Implement Zoho CRM sync
-  console.log('Syncing CRM:', { direction, entityTypes })
-  return { processed: 0, created: 0, updated: 0, failed: 0 }
-}
-
-async function syncIntacct(direction: string, entityTypes?: string[]): Promise<SyncResult> {
-  // TODO: Implement Sage Intacct sync
-  console.log('Syncing Intacct:', { direction, entityTypes })
-  return { processed: 0, created: 0, updated: 0, failed: 0 }
-}
-
-async function syncADP(): Promise<SyncResult> {
-  // TODO: Implement ADP sync (import only)
-  console.log('Syncing ADP')
-  return { processed: 0, created: 0, updated: 0, failed: 0 }
-}
-
-async function syncAbsorb(): Promise<SyncResult> {
-  // TODO: Implement Absorb LMS sync (import only)
-  console.log('Syncing Absorb')
-  return { processed: 0, created: 0, updated: 0, failed: 0 }
-}
-
-async function syncRamp(): Promise<SyncResult> {
-  // TODO: Implement Ramp sync (import only)
-  console.log('Syncing Ramp')
-  return { processed: 0, created: 0, updated: 0, failed: 0 }
-}
 
 // Export all functions for the Inngest handler
 export const functions = [syncApp, scheduledSync]
